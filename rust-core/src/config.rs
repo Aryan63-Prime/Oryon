@@ -10,6 +10,8 @@ pub enum QuantType {
     F32 = 0,
     Q8_0 = 1,
     Q4_0 = 2,
+    Q4_K = 3,
+    Q6_K = 4,
 }
 
 impl QuantType {
@@ -18,6 +20,8 @@ impl QuantType {
             0 => Ok(Self::F32),
             1 => Ok(Self::Q8_0),
             2 => Ok(Self::Q4_0),
+            3 => Ok(Self::Q4_K),
+            4 => Ok(Self::Q6_K),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported quant type id: {}", v),
@@ -30,6 +34,8 @@ impl QuantType {
             Self::F32 => "F32",
             Self::Q8_0 => "Q8_0",
             Self::Q4_0 => "Q4_0",
+            Self::Q4_K => "Q4_K",
+            Self::Q6_K => "Q6_K",
         }
     }
 }

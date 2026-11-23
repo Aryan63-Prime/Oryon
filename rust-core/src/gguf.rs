@@ -7,14 +7,19 @@ use crate::quant::{WeightMatrix, BLOCK_SIZE};
 use crate::tokenizer::BpeTokenizer;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use memmap2::Mmap;
+use std::io::Cursor;
+use std::sync::Arc;
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q8_0: u32 = 8;
+const GGML_TYPE_Q4_K: u32 = 12;
+const GGML_TYPE_Q6_K: u32 = 14;
 
 enum GgufVal {
     U32(u32),
@@ -33,7 +38,9 @@ struct TensorInfo {
 }
 
 pub fn load_gguf<P: AsRef<Path>>(path: P, max_seq_cap: usize) -> io::Result<(Transformer, BpeTokenizer)> {
-    let mut r = BufReader::new(File::open(path)?);
+    let file = File::open(path)?;
+    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+    let mut r = Cursor::new(mmap.as_ref());
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != GGUF_MAGIC {
@@ -105,11 +112,16 @@ pub fn load_gguf<P: AsRef<Path>>(path: P, max_seq_cap: usize) -> io::Result<(Tra
     let add_bos = get_bool(&meta, "tokenizer.ggml.add_bos_token").unwrap_or(true);
     let tokenizer = BpeTokenizer::from_gguf_vocab(vocab_tokens, bos_id, eos_id);
 
-    let token_embedding = read_weight_matrix(&mut r, &tensors, data_start, "token_embd.weight")?;
+    let token_embedding = read_weight_matrix(&mut r, &tensors, data_start, "token_embd.weight", &mmap)?;
     let primary_quant = match &token_embedding {
         WeightMatrix::Q4_0 { .. } => QuantType::Q4_0,
         WeightMatrix::Q8_0 { .. } => QuantType::Q8_0,
         WeightMatrix::F32 { .. } => QuantType::F32,
+        WeightMatrix::Q4_K { .. } => QuantType::Q4_K,
+        WeightMatrix::Q6_K { .. } => QuantType::Q6_K,
+        WeightMatrix::F32Mmap { .. } => QuantType::F32,
+        WeightMatrix::Q4KMmap { .. } => QuantType::Q4_K,
+        WeightMatrix::Q6KMmap { .. } => QuantType::Q6_K,
     };
 
     let mut layers = Vec::with_capacity(n_layers);
@@ -117,20 +129,20 @@ pub fn load_gguf<P: AsRef<Path>>(path: P, max_seq_cap: usize) -> io::Result<(Tra
         let p = format!("blk.{}", l);
         layers.push(LayerWeights {
             attn_norm: read_norm_vec(&mut r, &tensors, data_start, &format!("{}.attn_norm.weight", p))?,
-            wq: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_q.weight", p))?,
-            wk: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_k.weight", p))?,
-            wv: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_v.weight", p))?,
-            wo: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_output.weight", p))?,
+            wq: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_q.weight", p), &mmap)?,
+            wk: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_k.weight", p), &mmap)?,
+            wv: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_v.weight", p), &mmap)?,
+            wo: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.attn_output.weight", p), &mmap)?,
             ffn_norm: read_norm_vec(&mut r, &tensors, data_start, &format!("{}.ffn_norm.weight", p))?,
-            w_gate: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.ffn_gate.weight", p))?,
-            w_up: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.ffn_up.weight", p))?,
-            w_down: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.ffn_down.weight", p))?,
+            w_gate: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.ffn_gate.weight", p), &mmap)?,
+            w_up: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.ffn_up.weight", p), &mmap)?,
+            w_down: read_weight_matrix(&mut r, &tensors, data_start, &format!("{}.ffn_down.weight", p), &mmap)?,
         });
     }
 
     let final_norm = read_norm_vec(&mut r, &tensors, data_start, "output_norm.weight")?;
     let lm_head = if tensors.contains_key("output.weight") {
-        Some(read_weight_matrix(&mut r, &tensors, data_start, "output.weight")?)
+        Some(read_weight_matrix(&mut r, &tensors, data_start, "output.weight", &mmap)?)
     } else {
         None
     };
@@ -203,6 +215,7 @@ fn read_weight_matrix<R: Read + Seek>(
     tensors: &HashMap<String, TensorInfo>,
     data_start: u64,
     name: &str,
+    mmap: &Arc<Mmap>,
 ) -> io::Result<WeightMatrix> {
     let info = tensors.get(name).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, format!("Missing tensor: {}", name))
@@ -221,13 +234,12 @@ fn read_weight_matrix<R: Read + Seek>(
 
     match info.ggml_type {
         GGML_TYPE_F32 => {
-            let mut raw = vec![0u8; total * 4];
-            r.read_exact(&mut raw)?;
-            let data = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            Ok(WeightMatrix::F32 { rows, cols, data })
+            Ok(WeightMatrix::F32Mmap {
+                rows,
+                cols,
+                mmap: Arc::clone(mmap),
+                offset: (data_start + info.offset) as usize,
+            })
         }
         GGML_TYPE_F16 => {
             let mut raw = vec![0u8; total * 2];
@@ -288,6 +300,30 @@ fn read_weight_matrix<R: Read + Seek>(
                 packed,
             })
         }
+        GGML_TYPE_Q4_K => {
+            if cols % 256 != 0 || total % 256 != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Q4_K tensor cols must be a multiple of 256: {}", name)));
+            }
+            Ok(WeightMatrix::Q4KMmap {
+                rows,
+                cols,
+                mmap: Arc::clone(mmap),
+                offset: (data_start + info.offset) as usize,
+            })
+        }
+        GGML_TYPE_Q6_K => {
+            if cols % 256 != 0 || total % 256 != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Q6_K tensor cols must be a multiple of 256: {}", name)));
+            }
+            Ok(WeightMatrix::Q6KMmap {
+                rows,
+                cols,
+                mmap: Arc::clone(mmap),
+                offset: (data_start + info.offset) as usize,
+            })
+        }
         t => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -336,8 +372,8 @@ fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_gguf_string<R: Read>(r: &mut R) -> io::Result<String> {
-    let len = read_u64(&mut *r)? as usize;
+fn read_gguf_string<R: Read>(mut r: &mut R) -> io::Result<String> {
+    let len = read_u64(&mut r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
