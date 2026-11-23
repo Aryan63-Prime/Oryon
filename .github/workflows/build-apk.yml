@@ -32,10 +32,10 @@ jobs:
 
       - name: Build liboryon_lm.so for arm64-v8a (Snapdragon 8 Elite)
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
           RUSTFLAGS: "-C target-feature=+neon,+dotprod"
         run: |
           cd rust-core
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
           cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
 
       - name: Set up Gradle & Assemble Debug APK
