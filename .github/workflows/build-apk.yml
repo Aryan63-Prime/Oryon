@@ -32,7 +32,7 @@ jobs:
 
       - name: Build liboryon_lm.so for arm64-v8a (Snapdragon 8 Elite)
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
           RUSTFLAGS: "-C target-feature=+neon,+dotprod"
         run: |
           cd rust-core
