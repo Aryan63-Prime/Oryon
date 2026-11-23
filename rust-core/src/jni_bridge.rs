@@ -1,18 +1,26 @@
 use crate::gguf::load_gguf;
 use crate::model::{RunState, Transformer};
 use crate::npu_qnn::probe_hardware;
+use crate::npu_qnn::qnn_status;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
+use crate::vulkan_gpu::VulkanGpu;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct EngineHandle {
     model: Transformer,
     tokenizer: BpeTokenizer,
     state: RunState,
     backend_info: String,
+    backend_mode: i32,
+    active_backend: String,
+    gpu: VulkanGpu,
+    cancelled: AtomicBool,
+    native_lib_dir: String,
 }
 
 fn now_seed() -> u64 {
@@ -71,13 +79,19 @@ pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeLoadModel(
 
     match loaded {
         Ok((model, tokenizer)) => {
-            let hw = probe_hardware(&lib_dir);
+            let _hw = probe_hardware(&lib_dir);
+            let gpu = VulkanGpu::probe();
+            let active_backend = if gpu.available {
+                format!("GPU: {} (Vulkan)", gpu.name)
+            } else {
+                "CPU: ARM64 NEON (6 threads)".to_string()
+            };
             let info = format!(
                 "{:.2}M | {} | {:.1} MB RAM | {}",
                 model.config.param_count() as f64 / 1e6,
                 model.config.quant_type.name(),
                 model.estimated_ram_mb(),
-                hw.active_backend
+                active_backend
             );
             let state = RunState::new(&model.config);
             let handle = Box::new(EngineHandle {
@@ -85,6 +99,11 @@ pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeLoadModel(
                 tokenizer,
                 state,
                 backend_info: info,
+                backend_mode: 0,
+                active_backend,
+                gpu,
+                cancelled: AtomicBool::new(false),
+                native_lib_dir: lib_dir,
             });
             Box::into_raw(handle) as jlong
         }
@@ -105,6 +124,67 @@ pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeModelInfo(
     env.new_string(&eng.backend_info)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeSetBackend(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    mode: jint,
+) -> jstring {
+    if handle == 0 {
+        return env.new_string("CPU: ARM64 NEON (6 threads)")
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+    let eng = unsafe { &mut *(handle as *mut EngineHandle) };
+    let status = match mode {
+        1 => "CPU: ARM64 NEON (6 threads)".to_string(),
+        2 => {
+            if eng.gpu.available {
+                format!("GPU: {} (Vulkan)", eng.gpu.gpu_name())
+            } else {
+                "CPU: ARM64 NEON (Vulkan unavailable)".to_string()
+            }
+        }
+        3 => {
+            let (ok, qnn) = qnn_status(&eng.native_lib_dir);
+            if ok {
+                qnn.to_string()
+            } else {
+                format!("CPU: ARM64 NEON ({}; fallback)", qnn)
+            }
+        }
+        _ => {
+            if eng.gpu.available {
+                format!("GPU: {} (Vulkan)", eng.gpu.gpu_name())
+            } else {
+                "CPU: ARM64 NEON (6 threads)".to_string()
+            }
+        }
+    };
+    eng.backend_mode = mode;
+    eng.active_backend = status.clone();
+    eng.backend_info = eng.backend_info
+        .rsplit_once(" | ")
+        .map(|(prefix, _)| format!("{} | {}", prefix, status))
+        .unwrap_or_else(|| status.clone());
+    env.new_string(status)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeCancelGeneration(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        let eng = unsafe { &*(handle as *const EngineHandle) };
+        eng.cancelled.store(true, Ordering::Release);
+    }
 }
 
 #[no_mangle]
@@ -148,12 +228,18 @@ pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeGenerate(
 
     let mut history = Vec::with_capacity(max_pos);
     let mut pos = 0usize;
+    let mut gpu_executed = false;
 
     for &pt in &prompt_tokens {
         if pos >= max_pos {
             break;
         }
-        eng.model.forward(pt as usize, pos, &mut eng.state, n_threads);
+        if eng.backend_mode == 2 {
+            eng.model.forward(pt as usize, pos, &mut eng.state, n_threads,
+                Some(&mut eng.gpu), &mut gpu_executed);
+        } else {
+            eng.model.forward(pt as usize, pos, &mut eng.state, n_threads, None, &mut gpu_executed);
+        }
         history.push(pt);
         pos += 1;
     }
@@ -161,8 +247,12 @@ pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeGenerate(
     let t0 = Instant::now();
     let mut generated = 0usize;
     let mut full_out = String::new();
+    eng.cancelled.store(false, Ordering::Release);
 
     while generated < max_gen && pos < max_pos {
+        if eng.cancelled.load(Ordering::Acquire) {
+            break;
+        }
         let next_tok = sampler.sample(&mut eng.state.logits, &history);
         if next_tok == eng.tokenizer.eos_id {
             break;
@@ -186,18 +276,31 @@ pub extern "system" fn Java_com_oryon_ai_OryonEngine_nativeGenerate(
         }
 
         history.push(next_tok);
-        eng.model
-            .forward(next_tok as usize, pos, &mut eng.state, n_threads);
+        if eng.backend_mode == 2 {
+            eng.model.forward(next_tok as usize, pos, &mut eng.state, n_threads,
+                Some(&mut eng.gpu), &mut gpu_executed);
+        } else {
+            eng.model.forward(next_tok as usize, pos, &mut eng.state, n_threads, None, &mut gpu_executed);
+        }
         pos += 1;
         generated += 1;
     }
 
     let secs = t0.elapsed().as_secs_f64().max(1e-6);
+    let cancelled = eng.cancelled.load(Ordering::Acquire);
+    let displayed_backend = if eng.backend_mode == 2 && gpu_executed {
+        format!("GPU: {} (Vulkan)", eng.gpu.gpu_name())
+    } else if eng.backend_mode == 2 {
+        "CPU: ARM64 NEON (Vulkan unavailable)".to_string()
+    } else {
+        eng.active_backend.clone()
+    };
     let stats = format!(
-        "{} tokens | {:.1} tok/s | {} threads",
+        "{} tokens | {:.1} tok/s | {}{}",
         generated,
         generated as f64 / secs,
-        n_threads
+        displayed_backend,
+        if cancelled { " | cancelled" } else { "" }
     );
     env.new_string(stats)
         .map(|s| s.into_raw())

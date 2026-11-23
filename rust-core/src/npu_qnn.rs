@@ -11,6 +11,24 @@ pub struct HardwareStatus {
     pub active_backend: &'static str,
 }
 
+pub fn qnn_status(native_lib_dir: &str) -> (bool, &'static str) {
+    let paths = [
+        format!("{}/libQnnHtp.so", native_lib_dir),
+        "/vendor/lib64/libQnnHtp.so".to_string(),
+        "/system/vendor/lib64/libQnnHtp.so".to_string(),
+    ];
+    let htp = paths.iter().any(|p| Path::new(p).exists());
+    let fastrpc = Path::new("/dev/adsprpc-smd").exists()
+        || Path::new("/dev/fastrpc-cdsp").exists();
+    if htp && fastrpc {
+        (true, "NPU: Snapdragon QNN HTP")
+    } else if htp {
+        (false, "NPU unavailable: libQnnHtp.so found but FastRPC transport is missing")
+    } else {
+        (false, "NPU unavailable: libQnnHtp.so not bundled; using CPU fallback")
+    }
+}
+
 pub fn probe_hardware(native_lib_dir: &str) -> HardwareStatus {
     let has_fastrpc_device =
         Path::new("/dev/adsprpc-smd").exists() || Path::new("/dev/fastrpc-cdsp").exists();
