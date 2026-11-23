@@ -337,7 +337,7 @@ fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
 }
 
 fn read_gguf_string<R: Read>(r: &mut R) -> io::Result<String> {
-    let len = read_u64(&mut r)? as usize;
+    let len = read_u64(&mut *r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
